@@ -1,18 +1,33 @@
-"""Single-session state. mykaggle connects to one server at a time."""
+"""Single-session state with multi-kernel registry.
+
+mykaggle connects to one Kaggle server at a time, but can track multiple
+named kernels for running background or foreground jobs.
+"""
 
 import json
 import os
-from typing import Optional
+from typing import Dict, Optional
 
 import filelock
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+class KernelInfo(BaseModel):
+    name: str
+    kernel_id: str
+    session_id: str
+    started_at: str
+    command: Optional[str] = None
+    log_path: Optional[str] = None  # Remote path relative to /kaggle/working
 
 
 class SessionState(BaseModel):
-    url: str  # original compatible URL (carries the token)
-    kernel_id: Optional[str] = None
+    url: str  # original compatible URL (carries the token or proxy path)
+    kernel_id: Optional[str] = None  # primary / notebook kernel
     session_id: Optional[str] = None
     connected_at: Optional[str] = None
+    # Named kernels: name -> KernelInfo
+    kernels: Dict[str, KernelInfo] = Field(default_factory=dict)
 
 
 class StateStore:

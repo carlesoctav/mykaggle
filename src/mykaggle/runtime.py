@@ -2,10 +2,7 @@
 
 Auth mapping for Kaggle's two URL shapes:
     .../proxy          -> server_url=<full url>, token=None (JWT in path)
-    ...?token=<jwt>    -> server_url=<base>, token=<jwt> (Bearer REST, ?token= WS)
-
-Kernel attach policy stays mykaggle's own (verify stored id, else reuse
-first live kernel, else spawn) so reconnects never disturb the notebook.
+    ...?token=<jwt>    -> resolved to internal proxy URL or server_url=<base>, token=<jwt>
 """
 
 import logging
@@ -17,7 +14,7 @@ import jupyter_kernel_client
 import requests
 
 from mykaggle.net import friendly_error, is_retriable, request_with_retry
-from mykaggle.urls import redact, rest_url, split_server_url
+from mykaggle.urls import redact, resolve_jupyter_base, rest_url, split_server_url
 
 logger = logging.getLogger(__name__)
 
@@ -32,19 +29,16 @@ class KaggleRuntime:
         on_session_started: Optional[Callable[[str], None]] = None,
     ):
         self.server_url = url
-        self.base, self.token = split_server_url(url)
+        self.effective_base = resolve_jupyter_base(url)
+        self.base, self.token = split_server_url(self.effective_base)
         self.kernel_id = kernel_id
         self.session_id = session_id
         self.on_kernel_started = on_kernel_started
         self.on_session_started = on_session_started
         self._kernel_client = None
-        # NOTE: the lib's websocket threads are non-daemon, so a connected
-        # runtime MUST be stop()ed or the process hangs at exit. An atexit
-        # guard cannot help (threading._shutdown runs before atexit
-        # handlers), so every command path stops explicitly.
 
     # ------------------------------------------------------------------
-    # kernel lifecycle (REST; attach-first)
+    # kernel lifecycle (REST)
     # ------------------------------------------------------------------
     def ensure_kernel(self) -> str:
         """Return a live kernel id, reusing the stored one when possible."""
@@ -78,15 +72,68 @@ class KaggleRuntime:
             self.on_kernel_started(self.kernel_id)
         return self.kernel_id
 
+    def spawn_new_kernel(self) -> str:
+        """Always spawn a fresh independent kernel."""
+        try:
+            r = requests.post(
+                rest_url(self.base, self.token, "/api/kernels"),
+                json={"name": "python3"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            self.kernel_id = r.json()["id"]
+        except requests.exceptions.RequestException as e:
+            raise friendly_error(e) from e
+        if self.on_kernel_started:
+            self.on_kernel_started(self.kernel_id)
+        return self.kernel_id
+
+    def list_kernels(self) -> List[Dict[str, Any]]:
+        """List all active kernels on the server."""
+        try:
+            r = request_with_retry(
+                "GET", rest_url(self.base, self.token, "/api/kernels"), timeout=15
+            )
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            raise friendly_error(e) from e
+
+    def interrupt(self) -> None:
+        """Send SIGINT to current kernel."""
+        if not self.kernel_id:
+            return
+        requests.post(
+            rest_url(self.base, self.token, f"/api/kernels/{self.kernel_id}/interrupt"),
+            timeout=10,
+        )
+
+    def restart(self) -> None:
+        """Restart current kernel."""
+        if not self.kernel_id:
+            return
+        requests.post(
+            rest_url(self.base, self.token, f"/api/kernels/{self.kernel_id}/restart"),
+            timeout=15,
+        )
+
+    def delete_kernel(self, kernel_id: Optional[str] = None) -> None:
+        """Delete / stop kernel (204)."""
+        kid = kernel_id or self.kernel_id
+        if not kid:
+            return
+        requests.delete(
+            rest_url(self.base, self.token, f"/api/kernels/{kid}"),
+            timeout=15,
+        )
+
     @property
     def kernel_client(self):
         if not self._kernel_client:
-            kid = self.ensure_kernel()
+            kid = self.kernel_id or self.ensure_kernel()
             client_kwargs = {
                 "subprotocol": jupyter_kernel_client.JupyterSubprotocol.DEFAULT,
             }
             if self.session_id:
-                # WSSession (Session) expects 'session' for the ID
                 client_kwargs["session"] = self.session_id
 
             retries = 3
@@ -99,8 +146,6 @@ class KaggleRuntime:
                         kernel_id=kid,
                         client_kwargs=client_kwargs,
                     )
-                    # Force _own_kernel to False. This prevents the lib from
-                    # automatically deleting the kernel when the client closes.
                     self._kernel_client._own_kernel = False
                     self._kernel_client.start()
                     break
@@ -125,21 +170,26 @@ class KaggleRuntime:
     # ------------------------------------------------------------------
     # execution
     # ------------------------------------------------------------------
+    def execute_detached(self, code: str) -> str:
+        """Fire an execute request without waiting for results."""
+        client = self.kernel_client
+        session = client._manager.client.session
+        stream = client._manager.client.kernel_socket
+        msg = session.send(
+            stream, "shell", "execute_request", {"code": code, "silent": False}
+        )
+        return msg["header"]["msg_id"]
+
     def execute_code(
         self,
         code: str,
         output_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
         timeout: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """Execute code; timeout is an overall deadline (None waits forever).
-
-        The lib's own timeout only bounds the final reply wait, so the
-        deadline is enforced here: on expiry the kernel is interrupted
-        and TimeoutError is raised.
-        """
+        """Execute code in foreground; stream output and handle Ctrl+C."""
         from jupyter_kernel_client.client import output_hook as default_output_hook
 
-        client = self.kernel_client  # ensures kernel
+        client = self.kernel_client
         outputs: List[Dict[str, Any]] = []
 
         def wrapped_output_hook(msg):
@@ -164,23 +214,18 @@ class KaggleRuntime:
         worker.join(timeout)
         if worker.is_alive():
             try:
-                requests.post(
-                    rest_url(self.base, self.token, f"/api/kernels/{self.kernel_id}/interrupt"),
-                    timeout=10,
-                )
+                self.interrupt()
             except Exception:
                 pass
             worker.join(10)
             raise TimeoutError(f"Execution timed out after {timeout} seconds")
         if "error" in result:
             e = result["error"]
-            # Never leak the token (it may appear in handshake errors).
             raise RuntimeError(f"Kernel execution failed: {redact(str(e))}") from e
 
         reply = result.get("reply")
         reply_content = reply["content"] if reply else {"status": "error"}
 
-        # If there's an error status but no error in outputs, synthesize one
         if reply_content.get("status") == "error":
             has_error_output = any(o.get("output_type") == "error" for o in outputs)
             if not has_error_output:
@@ -198,15 +243,14 @@ class KaggleRuntime:
     def stop(self, shutdown_kernel: bool = False):
         if self._kernel_client:
             try:
-                # We manage kernel lifecycle explicitly. Bypass the manager's
-                # stop() and directly close channels and socket so a client
-                # close can never shut the kernel down.
                 client = self._kernel_client._manager.client
                 client.stop_channels()
                 if client.kernel_socket:
                     client.kernel_socket.close()
 
-                if shutdown_kernel:
-                    self._kernel_client._manager.shutdown_kernel(now=True)
+                if shutdown_kernel and self.kernel_id:
+                    self.delete_kernel(self.kernel_id)
             except Exception:
                 logging.exception("Error stopping kernel client")
+            finally:
+                self._kernel_client = None
