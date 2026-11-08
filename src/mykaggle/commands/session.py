@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import requests
 import typer
 from rich.console import Console
+from rich.table import Table
 from typing_extensions import Annotated
 
 from mykaggle.common import make_runtime, resolve_session, state
@@ -284,7 +285,7 @@ def _create_kernel_entity(
     return _kaggle_rpc("kernels.KernelsApiService", "SaveKernel", save_payload)
 
 
-def new_command(
+def create_command(
     name: Annotated[
         str,
         typer.Argument(help="Kernel slug 'owner/kernel-slug' or 'kernel-slug'"),
@@ -381,7 +382,7 @@ def new_command(
         start_command(slug=slug, machine=machine, internet=internet)
 
 
-def delete_kernel_command(
+def delete_command(
     slug: Annotated[
         str,
         typer.Argument(help="Kernel slug 'owner/kernel-slug' or 'kernel-slug' to delete"),
@@ -572,7 +573,7 @@ def start_command(
     connect_to(jupyter_url, kernel_slug=slug, kernel_session_id=ks_id)
 
 
-def cancel_command(
+def stop_command(
     session_id: Annotated[
         Optional[int],
         typer.Argument(help="Kaggle kernel session ID to cancel (defaults to active session)"),
@@ -1028,13 +1029,112 @@ def commit_command(
             raise typer.Exit(1)
 
 
-def register(app: typer.Typer):
-    app.command(name="connect")(connect_command)
-    app.command(name="start")(start_command)
-    app.command(name="cancel")(cancel_command)
-    app.command(name="new")(new_command)
-    app.command(name="create")(new_command)
-    app.command(name="delete-kernel")(delete_kernel_command)
-    app.command(name="commit")(commit_command)
-    app.command(name="batch")(commit_command)
-    app.command(name="attach")(attach_command)
+def ls_command(
+    search: Annotated[
+        Optional[str],
+        typer.Option("-s", "--search", help="Search query filter for kernels"),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("-n", "--limit", help="Maximum number of kernels to list"),
+    ] = 20,
+    table: Annotated[
+        bool,
+        typer.Option(
+            "--table",
+            help="Render output as a human-readable table instead of JSON",
+        ),
+    ] = False,
+):
+    """List Kaggle kernels and show currently active connected session."""
+    _, _, authed_user = _load_kaggle_auth()
+    user = authed_user or "carlesoctav"
+
+    payload = {"user": user, "group": "PROFILE", "pageSize": limit}
+    if search:
+        payload["search"] = search
+
+    try:
+        res = _kaggle_rpc("kernels.KernelsApiService", "ListKernels", payload)
+    except Exception as e:
+        typer.echo(f"[mykaggle] Failed to list kernels: {e}", err=True)
+        raise typer.Exit(1)
+
+    kernels_list = res.get("kernels") or []
+
+    prev = state.store.load()
+    active_slug = prev.kernel_slug if prev else None
+    active_ks_id = prev.kernel_session_id if prev else None
+    active_kid = prev.kernel_id if prev else None
+    connected_at = prev.connected_at if prev else None
+
+    if not table:
+        connected_session = None
+        if prev and (active_slug or active_ks_id or active_kid):
+            connected_session = {
+                "slug": active_slug,
+                "kernel_session_id": active_ks_id,
+                "kernel_id": active_kid,
+                "connected_at": connected_at,
+            }
+
+        kernels_data = []
+        for k in kernels_list:
+            ref = k.get("ref", "")
+            title = k.get("title", "")
+            last_run = k.get("lastRunTime", "")
+            if last_run and "T" in last_run:
+                last_run = last_run.replace("T", " ")[:19]
+            is_active = bool(active_slug and (ref == active_slug or ref.endswith(f"/{active_slug}")))
+            kernels_data.append({
+                "ref": ref,
+                "title": title,
+                "last_run_time": last_run,
+                "is_active": is_active,
+            })
+
+        out = {
+            "connected_session": connected_session,
+            "kernels": kernels_data,
+        }
+        typer.echo(json.dumps(out, indent=2))
+        return
+
+    if prev and (active_slug or active_ks_id):
+        _console.print(
+            f"[bold green]Connected Session:[/bold green] slug=[bold]{active_slug or '-'}[/bold] "
+            f"session_id=[cyan]{active_ks_id or '-'}[/cyan] connected_at=[dim]{connected_at or '-'}[/dim]"
+        )
+
+    rich_table = Table(title=f"Kaggle Kernels ({user})", show_header=True)
+    rich_table.add_column("Ref", style="cyan")
+    rich_table.add_column("Title")
+    rich_table.add_column("Last Run", style="dim")
+    rich_table.add_column("Status", style="bold")
+
+    for k in kernels_list:
+        ref = k.get("ref", "")
+        title = k.get("title", "")
+        last_run = k.get("lastRunTime", "")
+        if last_run and "T" in last_run:
+            last_run = last_run.replace("T", " ")[:19]
+        is_active = bool(active_slug and (ref == active_slug or ref.endswith(f"/{active_slug}")))
+        status_label = "[green]ACTIVE[/green]" if is_active else ""
+        ref_label = f"[bold green]{ref}[/bold green]" if is_active else ref
+        rich_table.add_row(ref_label, title, last_run, status_label)
+
+    _console.print(rich_table)
+
+
+session_app = typer.Typer(
+    help="Manage Kaggle kernel and VM sessions.",
+    no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+
+session_app.command(name="connect")(connect_command)
+session_app.command(name="create")(create_command)
+session_app.command(name="start")(start_command)
+session_app.command(name="delete")(delete_command)
+session_app.command(name="stop")(stop_command)
+session_app.command(name="ls")(ls_command)

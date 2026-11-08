@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Optional
 
 import click
@@ -5,7 +6,9 @@ import typer
 from typer.core import TyperGroup
 from typing_extensions import Annotated
 
-from mykaggle.commands import execution, packages, session
+from mykaggle.commands.execution import process_app
+from mykaggle.commands.session import connect_command, session_app
+from mykaggle.commands.uv_cmd import uv_app
 from mykaggle.common import setup_logging, state
 
 
@@ -27,7 +30,7 @@ class MykaggleGroup(TyperGroup):
 
 
 app = typer.Typer(
-    help="Kaggle CLI (colab-cli style, one session at a time).\n\nConnect: mykaggle <compatible-url>",
+    help="Kaggle CLI (colab-cli style, one session at a time).\n\nConnect: mykaggle session connect <compatible-url>",
     no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
     cls=MykaggleGroup,
@@ -83,10 +86,31 @@ def help_command(
         typer.echo(cmd.get_help(cmd_ctx))
 
 
-# Register subcommands
-session.register(app)
-execution.register(app)
-packages.register(app)
+@app.command(name="skill")
+def skill_command():
+    """
+    Print the mykaggle agent skill instructions (SKILL.md).
+    """
+    candidates = [
+        Path(__file__).resolve().parent / "SKILL.md",
+        Path(__file__).resolve().parents[2] / "skills" / "mykaggle" / "SKILL.md",
+        Path.home() / ".agents" / "skills" / "mykaggle" / "SKILL.md",
+    ]
+    for p in candidates:
+        if p.is_file():
+            typer.echo(p.read_text(encoding="utf-8"), nl=False)
+            return
+    typer.echo("SKILL.md not found.", err=True)
+    raise typer.Exit(code=1)
+
+
+# Register subapps
+app.add_typer(session_app, name="session")
+app.add_typer(process_app, name="process")
+app.add_typer(uv_app, name="uv")
+
+# Hidden connect command for `mykaggle <url>` callback
+app.command(name="connect", hidden=True)(connect_command)
 
 
 def main():

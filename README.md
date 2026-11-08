@@ -1,99 +1,118 @@
 # mykaggle
 
-Kaggle CLI modeled on `google-colab-cli`: one connected session at a time,
-kernel-backed `exec` / `repl`, Contents API uploads, `%pip` installs.
-
-(Kaggle's proxy only routes `/api/*`, so there is no server-terminal
-equivalent of `colab console` / `colab ssh` — everything goes over kernel
-channels. See `test-muse` notes for the probe results.)
+Streamlined Kaggle CLI organized into three clean subcommand groups:
+- **`mykaggle session`**: Manage Kaggle kernel entities and interactive VM sessions.
+- **`mykaggle process`**: Manage code execution, background jobs, logs, and process lifecycles on active sessions.
+- **`mykaggle uv`**: Build lightweight wheelhouses for Kaggle offline environments by filtering pre-installed packages.
 
 ## Install
 
 ```bash
 cd ~/personal/mykaggle
 uv sync
-# then either:
-uv run mykaggle --help
-# or install the binary on PATH:
-uv tool install .
+
+# Install global binary on PATH:
+XDG_DATA_HOME=$HOME/.local/share XDG_BIN_HOME=$HOME/.local/bin uv tool install --force .
 ```
 
-## Usage
+## Quick Reference
+
+### 1. Session Management (`mykaggle session`)
 
 ```bash
-# Create a brand new kernel on Kaggle (with optional initial accelerator / data sources)
-mykaggle new my-new-experiment -t "My New Experiment" -m l4 -c gemma-4-developer-agent --start
-mykaggle new my-script --type script -f train.py
+# List your Kaggle kernels and view active connected session (JSON by default, --table for table)
+mykaggle session ls
+mykaggle session ls --table
+mykaggle session ls -s batch -n 10
+
+# Create a brand new kernel entity on Kaggle
+mykaggle session create my-new-experiment -t "My New Experiment" -m l4 -c gemma-4-developer-agent --start
+mykaggle session create my-script --type script -f train.py
+
+# Start (or restart) an interactive Kaggle VM session and connect to it
+# (auto-creates the kernel if it doesn't already exist on Kaggle)
+mykaggle session start carlesoctav/mykaggle-batch-test -m l4       # 4x NVIDIA L4
+mykaggle session start carlesoctav/mykaggle-batch-test -m t4 --internet
+mykaggle session start -m p100                                     # reuses last kernel slug
+mykaggle session start -m tpu
+mykaggle session start -m cpu
+
+# Cancel / shut down active Kaggle VM session
+mykaggle session stop
 
 # Delete a kernel from Kaggle
-mykaggle delete-kernel my-new-experiment -y
+mykaggle session delete my-new-experiment -y
 
-# Start (or restart) an interactive Kaggle VM session and auto-connect (auto-creates kernel if it does not exist)
-mykaggle start carlesoctav/mykaggle-batch-test -m l4       # 4x NVIDIA L4 (on supported competition kernels)
-mykaggle start carlesoctav/mykaggle-batch-test -m t4 --internet
-mykaggle start -m p100                                     # reuses last kernel_slug
-mykaggle start -m tpu
-mykaggle start -m cpu
-mykaggle cancel                                            # shut down active Kaggle VM session
+# Connect manually with proxy URL
+mykaggle session connect 'https://kkb-production.jupyter-proxy.kaggle.net/k/<id>/<jwt>/proxy'
+```
 
-# Trigger a batch "Save & Run All" commit for a kernel slug (preserves datasets/models/settings)
-mykaggle commit carlesoctav/mykaggle-batch-test
-mykaggle commit carlesoctav/mykaggle-batch-test -f train.py -m l4 -w -o ./out
-mykaggle commit carlesoctav/mykaggle-batch-test -c "python train.py --epochs 10" -m t4 -w
+### 2. Process & Execution (`mykaggle process`)
 
-# Or connect manually with a Jupyter proxy URL:
-mykaggle 'https://kkb-production.jupyter-proxy.kaggle.net/k/<id>/<jwt>/proxy'
-mykaggle connect 'https://kkb-production.jupyter-proxy.kaggle.net?token=<jwt>'
+```bash
+# Run shell command on the main notebook kernel (streaming output + logging to .mykaggle/logs/main.log)
+mykaggle process run "nvidia-smi"
 
-# Execute inline code / a file (uploads, then %run) / stdin
-mykaggle exec "import torch; print(torch.cuda.get_device_name(0))"
-mykaggle exec -f train.py
-echo "print(1 + 1)" | mykaggle exec
+# Run a dedicated named kernel / background job
+mykaggle process run -n train -d "python train.py --epochs 10"
 
-# Run shell commands or local Python files on named kernels (reused if name exists)
-mykaggle run "nvidia-smi"
-mykaggle run -n train -d "python train.py --epochs 10"
-mykaggle run-file train.py -n train -d -- --epochs 10
+# Run a local Python file with arguments (streams stdout/stderr, injected into sys.argv)
+mykaggle process run -f train.py -- --epochs 10 --batch-size 32
+mykaggle process run -f train.py -n worker -d -- --epochs 50
 
-# View/follow logs & manage named kernels
-mykaggle logs
-mykaggle logs train -f
-mykaggle int train
-mykaggle restart train
-mykaggle stop train   # or: mykaggle rm train
+# View or follow logs
+mykaggle process logs                 # list all recorded kernels/jobs as JSON (--table for table)
+mykaggle process logs --table         # list recorded kernels/jobs as human-readable table
+mykaggle process logs train           # print last lines
+mykaggle process logs train -f        # stream/follow output
+
+# Interrupt a running kernel (SIGINT; defaults to 'main')
+mykaggle process int
+mykaggle process int train
+mykaggle process int -n train
+
+# Stop and delete a kernel process
+mykaggle process rm train
+mykaggle process rm -n train
 
 # Dynamically attach or refresh datasets, models, kernel outputs, or competitions in /kaggle/input
-mykaggle attach owner/dataset-slug
-mykaggle attach owner/dataset-slug -v 3
-mykaggle attach google/gemma-2/pytorch/gemma-2-2b-it/2
-mykaggle attach owner/kernel-slug --kernel
-mykaggle attach gemma-4-developer-agent --competition
+mykaggle process attach owner/dataset-slug
+mykaggle process attach owner/dataset-slug -v 3
+mykaggle process attach google/gemma-2/pytorch/gemma-2-2b-it/2
+mykaggle process attach owner/kernel-slug --kernel
+mykaggle process attach gemma-4-developer-agent --competition
 
-# Interactive REPL on the kernel
-mykaggle repl
-
-# Install packages on the kernel
-mykaggle install requests httpx
-mykaggle install -r requirements.txt
+# Submit a batch "Save & Run All" commit for a kernel slug
+mykaggle process commit carlesoctav/mykaggle-batch-test
+mykaggle process commit carlesoctav/mykaggle-batch-test -f train.py -m l4 -w -o ./out
+mykaggle process commit carlesoctav/mykaggle-batch-test -c "python train.py --epochs 10" -m t4 -w
 ```
 
-Global options: `--config PATH` (override state file), `--logtostderr`.
+### 3. UV & Wheelhouse Management (`mykaggle uv`)
 
-## Layout (mirrors colab-cli)
+```bash
+# Preview packages that would be built without downloading/building (dry run)
+mykaggle uv make-wheel --dry-run
+mykaggle uv make-wheel --dry-run /path/to/project
 
+# Build wheels for project dependencies into ./kaggle_wheelhouse (filters Kaggle pre-installed packages)
+mykaggle uv make-wheel
+
+# Specify project directory or custom wheelhouse output directory
+mykaggle uv make-wheel /path/to/project -o ./my_wheelhouse
+mykaggle uv make-wheel ./dist_wheels
+
+# Build all dependencies without filtering Kaggle pre-installed packages
+mykaggle uv make-wheel --full
+
+# Strict constrained resolution against exact Kaggle version pins (resolves version conflicts automatically)
+mykaggle uv make-wheel-strict --dry-run /path/to/project
+mykaggle uv make-wheel-strict /path/to/project -o ./my_wheelhouse
+mykaggle uv make-wheel-strict --full
 ```
-src/mykaggle/
-  cli.py          typer app, AlphabeticalGroup, `mykaggle <url>` callback
-  common.py       global state, resolve_session(), logging
-  state.py        single SessionState + locked StateStore
-  runtime.py      KaggleRuntime: kernel WS client, execute_code + hooks
-  net.py          retries + friendly network errors (credentials masked)
-  contents.py     ContentsClient: upload/download
-  repl.py         prompt-toolkit REPL
-  utils.py        output rendering (text, display data, images)
-  urls.py         ?token= and /k/.../proxy URL handling
-  commands/
-    session.py    connect
-    execution.py  exec, repl
-    packages.py   install
-```
+
+## Global Options
+
+- `--config PATH`: Path to session state file (defaults to `~/.config/mykaggle/session.json`)
+- `--logtostderr`: Log all debug output to stderr
+- `-h, --help`: Show help for any command or group
