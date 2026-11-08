@@ -26,6 +26,8 @@ class SessionState(BaseModel):
     kernel_id: Optional[str] = None  # primary / notebook kernel
     session_id: Optional[str] = None
     connected_at: Optional[str] = None
+    kernel_slug: Optional[str] = None  # e.g. 'carlesoctav/mykaggle-batch-test'
+    kernel_session_id: Optional[int] = None  # Kaggle VM session ID (/k/<id>/...)
     # Named kernels: name -> KernelInfo
     kernels: Dict[str, KernelInfo] = Field(default_factory=dict)
 
